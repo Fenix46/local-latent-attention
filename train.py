@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-heads", type=int, default=2)
     parser.add_argument("--latent-query-block-size", type=int, default=0)
     parser.add_argument("--checkpoint-blocks", action="store_true")
+    parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--eval-batches", type=int, default=1)
     parser.add_argument("--profile-attention", action="store_true")
@@ -68,12 +69,15 @@ def evaluate(
     batch_size: int,
     device: torch.device,
     batches: int,
+    amp_ctx=None,
 ) -> dict:
     model.eval()
     totals: dict[str, float] = {}
+    ctx = amp_ctx if amp_ctx is not None else torch.amp.autocast(device_type="cuda", enabled=False)
     for _ in range(batches):
         x, y = dataset.sample_batch(batch_size=batch_size, device=device)
-        logits = model(x)
+        with ctx:
+            logits = model(x)
         _, metrics = compute_loss_and_metrics(
             logits,
             y,
@@ -276,10 +280,17 @@ def main() -> None:
         latent_query_block_size=args.latent_query_block_size,
         checkpoint_blocks=args.checkpoint_blocks,
     ).to(device)
+    if args.bf16:
+        model = model.to(torch.bfloat16)
     if args.profile_attention and hasattr(model, "set_profile"):
         model.set_profile(True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    amp_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if args.bf16 and device.type == "cuda"
+        else torch.amp.autocast(device_type="cuda", enabled=False)
+    )
     metrics = []
     start = time.perf_counter()
     reset_peak_memory(device)
@@ -287,12 +298,13 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         model.train()
         x, y = train_dataset.sample_batch(batch_size=args.batch_size, device=device)
-        logits = model(x)
-        loss, _ = compute_loss_and_metrics(
-            logits,
-            y,
-            bits_metric_name=getattr(train_dataset, "bits_metric_name", "eval_bpb"),
-        )
+        with amp_ctx:
+            logits = model(x)
+            loss, _ = compute_loss_and_metrics(
+                logits,
+                y,
+                bits_metric_name=getattr(train_dataset, "bits_metric_name", "eval_bpb"),
+            )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -307,7 +319,7 @@ def main() -> None:
         current_lr = optimizer.param_groups[0]["lr"]
         row = {"step": step, "train_loss": loss.item(), "lr": current_lr}
         if step % args.eval_every == 0 or step == args.steps:
-            row.update(evaluate(model, eval_dataset, args.batch_size, device, batches=args.eval_batches))
+            row.update(evaluate(model, eval_dataset, args.batch_size, device, batches=args.eval_batches, amp_ctx=amp_ctx))
         append_memory_stats(row, device)
         append_profile_stats(row, model, args.profile_attention)
         metrics.append(row)
