@@ -212,21 +212,15 @@ class LocalLatentAttention(nn.Module):
         chunk_ids = torch.arange(seq_len, device=x.device) // chunk_size
         return pooled, chunk_ids
 
-    def _pool_query_blocks(self, x: torch.Tensor, query_chunk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _block_query_inputs(self, x: torch.Tensor, query_chunk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, dim = x.shape
         block_size = min(seq_len, self.latent_query_block_size)
-        block_count = math.ceil(seq_len / block_size)
-        pad_len = block_count * block_size - seq_len
-
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len))
-
-        pooled = x.view(batch, block_count, block_size, dim).mean(dim=2)
-        block_chunk_ids = []
-        for start in range(0, seq_len, block_size):
-            end = min(start + block_size, seq_len)
-            block_chunk_ids.append(query_chunk_ids[start:end].min())
-        return pooled, torch.stack(block_chunk_ids)
+        block_starts = torch.arange(0, seq_len, block_size, device=x.device)
+        # Use the first token of each macro-block as the latent query anchor.
+        # This keeps one remote query per block without leaking future tokens.
+        pooled = x.index_select(1, block_starts)
+        block_chunk_ids = query_chunk_ids.index_select(0, block_starts)
+        return pooled, block_chunk_ids
 
     def _local_attention(
         self,
@@ -320,7 +314,7 @@ class LocalLatentAttention(nn.Module):
             self.latent_head_dim,
         ).transpose(1, 2)
         if self.latent_query_block_size > 1:
-            query_source, latent_query_ids = self._pool_query_blocks(x, query_chunk_ids)
+            query_source, latent_query_ids = self._block_query_inputs(x, query_chunk_ids)
         else:
             query_source = x
             latent_query_ids = query_chunk_ids
