@@ -230,10 +230,6 @@ def main() -> None:
     n_params = model.count_parameters()
     print(json.dumps({"event": "model", "params": n_params, "config": config.__dict__}))
 
-    if args.compile and device.type == "cuda":
-        model = torch.compile(model, mode="reduce-overhead")
-        print(json.dumps({"event": "compile", "mode": "reduce-overhead"}))
-
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -250,11 +246,16 @@ def main() -> None:
         else torch.amp.autocast(device_type=device.type, enabled=False)
     )
 
-    # Resume
+    # Resume — must happen BEFORE torch.compile so key names match
     start_step = 0
     if args.resume is not None:
         start_step = load_checkpoint(args.resume, model, optimizer)
         print(json.dumps({"event": "resume", "step": start_step}))
+
+    # torch.compile — after resume so checkpoint keys match uncompiled model
+    if args.compile and device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+        print(json.dumps({"event": "compile", "mode": "reduce-overhead"}))
 
     # Training
     metrics: list[dict] = []
