@@ -75,7 +75,7 @@ if HAS_TRITON:
         d_offs  = tl.arange(0, d)
 
         base_q  = bh * N
-        base_kv = bh * C
+        base_kv = bh * C_real
 
         # Load Q block: (BLOCK_Q, d)
         q = tl.load(
@@ -196,7 +196,7 @@ if HAS_TRITON:
         d_offs  = tl.arange(0, d)
 
         base_q  = bh * N
-        base_kv = bh * C
+        base_kv = bh * C_real
 
         q  = tl.load(Q_ptr  + base_q + q_offs[:, None] * stride_qn + d_offs[None, :] * stride_qd,
                      mask=q_valid[:, None], other=0.0)

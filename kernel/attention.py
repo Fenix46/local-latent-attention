@@ -41,7 +41,10 @@ def _merge(
     m  = torch.maximum(m_a, m_b)
     ea = torch.exp(m_a - m)
     eb = torch.exp(m_b - m)
-    return m, l_a * ea + l_b * eb, o_a * ea.unsqueeze(-1) + o_b * eb.unsqueeze(-1)
+    # o may be bfloat16 while ea/eb are float32 — cast to o dtype to preserve input dtype
+    ea_o = ea.to(o_a.dtype)
+    eb_o = eb.to(o_b.dtype)
+    return m, l_a * ea + l_b * eb, o_a * ea_o.unsqueeze(-1) + o_b * eb_o.unsqueeze(-1)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -233,6 +236,7 @@ class HierarchicalAttention(nn.Module):
             dtype=torch.float32,
         )
         self.gammas = nn.Parameter(gammas)   # (n_levels+1,)
+        self._mask_cache: dict = {}
 
     def _build_hierarchy(
         self,
@@ -284,17 +288,18 @@ class HierarchicalAttention(nn.Module):
             k_l, v_l, _ = entry
             chunk_size = self.chunk_B ** lvl
 
-            m_l, l_l, o_l = compressed_level_triton(
+            m_l, l_l, o_l = _compressed_level_attention(
                 q, k_l, v_l,
                 chunk_size = chunk_size,
                 local_W    = self.local_W,
                 gamma      = self.gammas[lvl],
                 scale      = self.scale,
+                mask_cache = self._mask_cache,
             )
             m, l, o = _merge(m, l, o, m_l, l_l, o_l)
 
         # ── Output ──
-        return o / l.clamp(min=1e-8).unsqueeze(-1)
+        return o / l.to(o.dtype).clamp(min=1e-8).unsqueeze(-1)
 
 
 # ──────────────────────────────────────────────────────────────────
