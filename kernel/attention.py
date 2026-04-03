@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kernel.triton_local import sliding_window_triton_accum, HAS_TRITON
+from kernel.triton_hier import compressed_level_triton
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -232,7 +233,6 @@ class HierarchicalAttention(nn.Module):
             dtype=torch.float32,
         )
         self.gammas = nn.Parameter(gammas)   # (n_levels+1,)
-        self._mask_cache: dict = {}
 
     def _build_hierarchy(
         self,
@@ -284,13 +284,12 @@ class HierarchicalAttention(nn.Module):
             k_l, v_l, _ = entry
             chunk_size = self.chunk_B ** lvl
 
-            m_l, l_l, o_l = _compressed_level_attention(
+            m_l, l_l, o_l = compressed_level_triton(
                 q, k_l, v_l,
                 chunk_size = chunk_size,
                 local_W    = self.local_W,
                 gamma      = self.gammas[lvl],
                 scale      = self.scale,
-                mask_cache = self._mask_cache,
             )
             m, l, o = _merge(m, l, o, m_l, l_l, o_l)
 
