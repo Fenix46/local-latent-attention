@@ -116,26 +116,28 @@ if HAS_TRITON:
                 other=0.0,
             )  # (BLOCK_K, d)
 
-            # Scores: (BLOCK_Q, BLOCK_K)
-            s = tl.dot(q.to(tl.float32), tl.trans(k).to(tl.float32)) * scale
+            # Scores: (BLOCK_Q, BLOCK_K) — keep everything float32
+            s = tl.dot(q.to(tl.float32), tl.trans(k).to(tl.float32))
+            s = s * tl.cast(scale, tl.float32)
 
             # ALiBi: bias = -gamma * max(q_pos - k_pos, 0)
             dist = (q_offs[:, None].to(tl.float32)
                     - k_offs[None, :].to(tl.float32))
-            dist = tl.maximum(dist, 0.0)
-            s = s - gamma * dist
+            dist = tl.maximum(dist, tl.zeros_like(dist))
+            s = s - tl.cast(gamma, tl.float32) * dist
 
             # Mask: causal (k > q) and window (dist >= W) and padding
             causal  = k_offs[None, :] > q_offs[:, None]
             out_win = dist >= tl.cast(W, tl.float32)
             invalid = causal | out_win | (~k_valid)[None, :]
-            s = tl.where(invalid, tl.full(s.shape, float("-inf"), dtype=tl.float32), s)
+            neg_inf = tl.full(s.shape, -1e38, dtype=tl.float32)
+            s = tl.where(invalid, neg_inf, s)
 
-            # Online softmax update
-            m_new  = tl.maximum(m, tl.max(s, axis=1))
+            # Online softmax update — all float32
+            m_new  = tl.maximum(m, tl.max(s, axis=1).to(tl.float32))
             alpha  = tl.exp(m - m_new)
             beta   = tl.exp(s - m_new[:, None])
-            beta   = tl.where(invalid, 0.0, beta)
+            beta   = tl.where(invalid, tl.zeros_like(beta), beta)
 
             acc_l = acc_l * alpha + tl.sum(beta, axis=1)
             acc_o = acc_o * alpha[:, None] + tl.dot(beta.to(v.dtype), v).to(tl.float32)
@@ -237,20 +239,21 @@ if HAS_TRITON:
             v = tl.load(v_base + k_offs[:, None] * stride_n + d_offs[None, :],
                         mask=k_valid[:, None], other=0.0)
 
-            # Recompute s
-            s    = tl.dot(q.to(tl.float32), tl.trans(k).to(tl.float32)) * scale
-            dist = tl.maximum(
-                q_offs[:, None].to(tl.float32) - k_offs[None, :].to(tl.float32), 0.0)
-            s    = s - gamma * dist
+            # Recompute s — keep everything float32
+            s    = tl.dot(q.to(tl.float32), tl.trans(k).to(tl.float32))
+            s    = s * tl.cast(scale, tl.float32)
+            dist = q_offs[:, None].to(tl.float32) - k_offs[None, :].to(tl.float32)
+            dist = tl.maximum(dist, tl.zeros_like(dist))
+            s    = s - tl.cast(gamma, tl.float32) * dist
 
             causal  = k_offs[None, :] > q_offs[:, None]
             out_win = dist >= tl.cast(W, tl.float32)
             invalid = causal | out_win | (~k_valid)[None, :]
-            s       = tl.where(invalid, tl.full(s.shape, float("-inf"), dtype=tl.float32), s)
+            s       = tl.where(invalid, tl.full(s.shape, -1e38, dtype=tl.float32), s)
 
             # Recompute P from saved (m, l): P = exp(s - m_i) / l_i
             p = tl.exp(s - m[:, None]) / l[:, None]
-            p = tl.where(invalid, 0.0, p)   # (BLOCK_Q, BLOCK_K)
+            p = tl.where(invalid, tl.zeros_like(p), p)   # (BLOCK_Q, BLOCK_K)
 
             # dV += P^T · dO
             dv = tl.dot(tl.trans(p.to(do.dtype)), do)   # (BLOCK_K, d)
