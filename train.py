@@ -150,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gamma-init",  type=float, default=0.1)
     p.add_argument("--dropout",     type=float, default=0.0)
     p.add_argument("--grad-checkpoint", action="store_true")
+    p.add_argument("--compile",         action="store_true")
 
     # Training
     p.add_argument("--steps",        type=int,   default=10000)
@@ -228,6 +229,10 @@ def main() -> None:
 
     n_params = model.count_parameters()
     print(json.dumps({"event": "model", "params": n_params, "config": config.__dict__}))
+
+    if args.compile and device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+        print(json.dumps({"event": "compile", "mode": "reduce-overhead"}))
 
     # Optimizer
     optimizer = torch.optim.AdamW(
