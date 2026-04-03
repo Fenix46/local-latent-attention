@@ -400,6 +400,36 @@ if HAS_TRITON:
             return dq.view(B, H, N, d), dk.view(B, H, N, d), dv.view(B, H, N, d), None, None, None
 
 
+_TRITON_RUNTIME_OK: bool | None = None   # None = untested, True = ok, False = broken
+
+
+def _check_triton_runtime() -> bool:
+    """
+    Lazily test whether the Triton CUDA driver compiles successfully.
+    Result is cached so the check runs at most once per process.
+    """
+    global _TRITON_RUNTIME_OK
+    if _TRITON_RUNTIME_OK is not None:
+        return _TRITON_RUNTIME_OK
+    if not HAS_TRITON:
+        _TRITON_RUNTIME_OK = False
+        return False
+    try:
+        import triton.runtime.driver  # noqa: F401 — triggers driver init
+        _TRITON_RUNTIME_OK = True
+    except Exception:
+        import warnings
+        warnings.warn(
+            "Triton CUDA driver failed to initialise (libcuda.so not found?). "
+            "Falling back to PyTorch sliding-window attention. "
+            "Fix: export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _TRITON_RUNTIME_OK = False
+    return _TRITON_RUNTIME_OK
+
+
 def sliding_window_triton_accum(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -414,14 +444,14 @@ def sliding_window_triton_accum(
     Returns (m, l, o) accumulators — unnormalised — ready for merge with
     compressed levels via the ⊕ operator.
 
-    Falls back to PyTorch if Triton unavailable or tensors on CPU.
+    Falls back to PyTorch if Triton unavailable, driver broken, or tensors on CPU.
 
     q, k, v : (B, H, N, d)  contiguous, fp16 or bf16
     m       : (B, H, N)     float32
     l       : (B, H, N)     float32
     o       : (B, H, N, d)  same dtype as q
     """
-    if not HAS_TRITON or not q.is_cuda:
+    if not q.is_cuda or not _check_triton_runtime():
         return _sw_pytorch_accum(q, k, v, window, gamma, scale)
     q = q.contiguous()
     k = k.contiguous()
