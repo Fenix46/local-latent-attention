@@ -54,14 +54,14 @@ if HAS_TRITON:
         stride_ln,
         # Scalars
         N: tl.constexpr,
-        C: tl.constexpr,          # number of compressed chunks
+        C_real,                    # actual number of chunks (runtime bound for loop)
         d: tl.constexpr,
         S,                         # chunk_size = B^level  (runtime, not constexpr)
         W,                         # local window size     (runtime)
         scale,                     # 1/sqrt(d)
         gamma,                     # ALiBi slope for this level
         BLOCK_Q: tl.constexpr,
-        BLOCK_C: tl.constexpr,    # tile size over chunks
+        BLOCK_C: tl.constexpr,    # tile size for tl.dot (>= 16, power of 2)
     ):
         """
         Grid: (ceil(N/BLOCK_Q), BH)
@@ -96,9 +96,9 @@ if HAS_TRITON:
 
         # Iterate over chunk tiles
         c_start = 0
-        while c_start < C:
+        while c_start < C_real:
             c_offs  = c_start + tl.arange(0, BLOCK_C)   # (BLOCK_C,)
-            c_valid = c_offs < C
+            c_valid = c_offs < C_real
 
             # chunk_end = (c+1) * S,  centroid = c*S + S/2
             chunk_end = (c_offs.to(tl.float32) + 1.0) * tl.cast(S, tl.float32)   # (BLOCK_C,)
@@ -181,7 +181,7 @@ if HAS_TRITON:
         stride_kc, stride_kd,
         stride_ln,
         N: tl.constexpr,
-        C: tl.constexpr,
+        C_real,
         d: tl.constexpr,
         S, W, scale, gamma,
         BLOCK_Q: tl.constexpr,
@@ -211,9 +211,9 @@ if HAS_TRITON:
         threshold = q_offs.to(tl.float32) - tl.cast(W, tl.float32) + 1.0
 
         c_start = 0
-        while c_start < C:
+        while c_start < C_real:
             c_offs  = c_start + tl.arange(0, BLOCK_C)
-            c_valid = c_offs < C
+            c_valid = c_offs < C_real
 
             chunk_end = (c_offs.to(tl.float32) + 1.0) * tl.cast(S, tl.float32)
             centroid  = c_offs.to(tl.float32) * tl.cast(S, tl.float32) + tl.cast(S, tl.float32) * 0.5
@@ -302,7 +302,7 @@ if HAS_TRITON:
             o2 = torch.zeros((BH, N, d),       device=q.device, dtype=q.dtype)
 
             # BLOCK_C must be power of 2 and >= C, capped at 128
-            BLOCK_C = min(128, triton.next_power_of_2(max(C, 1)))
+            BLOCK_C = min(128, triton.next_power_of_2(max(C, 16)))
             BLOCK_Q = 64
             grid = (triton.cdiv(N, BLOCK_Q), BH)
 
@@ -311,7 +311,7 @@ if HAS_TRITON:
                 stride_qn=q2.stride(1),  stride_qd=q2.stride(2),
                 stride_kc=kc2.stride(1), stride_kd=kc2.stride(2),
                 stride_ln=1,
-                N=N, C=BLOCK_C, d=d,
+                N=N, C_real=C, d=d,
                 S=chunk_size, W=local_W,
                 scale=scale, gamma=gamma.item(),
                 BLOCK_Q=BLOCK_Q, BLOCK_C=BLOCK_C,
@@ -363,7 +363,7 @@ if HAS_TRITON:
                 stride_qn=q2.stride(1),   stride_qd=q2.stride(2),
                 stride_kc=kc2.stride(1),  stride_kd=kc2.stride(2),
                 stride_ln=1,
-                N=N, C=BLOCK_C, d=d,
+                N=N, C_real=C, d=d,
                 S=chunk_size, W=local_W,
                 scale=scale, gamma=gamma.item(),
                 BLOCK_Q=BLOCK_Q, BLOCK_C=BLOCK_C,
