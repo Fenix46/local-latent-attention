@@ -405,7 +405,9 @@ _TRITON_RUNTIME_OK: bool | None = None   # None = untested, True = ok, False = b
 
 def _check_triton_runtime() -> bool:
     """
-    Lazily test whether the Triton CUDA driver compiles successfully.
+    Lazily test whether the Triton CUDA driver compiles and runs successfully.
+    Probes by actually calling get_current_device() — the same call that fails
+    at kernel launch time — so we catch build errors before the first forward pass.
     Result is cached so the check runs at most once per process.
     """
     global _TRITON_RUNTIME_OK
@@ -415,14 +417,16 @@ def _check_triton_runtime() -> bool:
         _TRITON_RUNTIME_OK = False
         return False
     try:
-        import triton.runtime.driver  # noqa: F401 — triggers driver init
+        from triton.runtime.driver import driver as _drv
+        _drv.active.get_current_device()   # triggers full driver init + C compilation
         _TRITON_RUNTIME_OK = True
     except Exception:
         import warnings
         warnings.warn(
-            "Triton CUDA driver failed to initialise (libcuda.so not found?). "
-            "Falling back to PyTorch sliding-window attention. "
-            "Fix: export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH",
+            "Triton CUDA driver failed to initialise (libcuda.so link error?). "
+            "Falling back to PyTorch sliding-window attention.\n"
+            "Fix: ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /usr/local/cuda/lib64/libcuda.so.1\n"
+            "     export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH",
             RuntimeWarning,
             stacklevel=2,
         )
