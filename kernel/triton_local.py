@@ -129,7 +129,7 @@ if HAS_TRITON:
             causal  = k_offs[None, :] > q_offs[:, None]
             out_win = dist >= tl.cast(W, tl.float32)
             invalid = causal | out_win | (~k_valid)[None, :]
-            s = tl.where(invalid, float("-inf"), s)
+            s = tl.where(invalid, tl.full(s.shape, float("-inf"), dtype=tl.float32), s)
 
             # Online softmax update
             m_new  = tl.maximum(m, tl.max(s, axis=1))
@@ -218,7 +218,7 @@ if HAS_TRITON:
                      mask=q_valid[:, None], other=0.0)
         do = tl.load(do_base + q_offs[:, None] * stride_n + d_offs[None, :],
                      mask=q_valid[:, None], other=0.0)
-        m  = tl.load(m_base  + q_offs, mask=q_valid, other=float("-inf"))
+        m  = tl.load(m_base  + q_offs, mask=q_valid, other=-1e38)
         l  = tl.load(l_base  + q_offs, mask=q_valid, other=1.0)
         l  = tl.maximum(l, 1e-8)   # numerical safety
 
@@ -246,7 +246,7 @@ if HAS_TRITON:
             causal  = k_offs[None, :] > q_offs[:, None]
             out_win = dist >= tl.cast(W, tl.float32)
             invalid = causal | out_win | (~k_valid)[None, :]
-            s       = tl.where(invalid, float("-inf"), s)
+            s       = tl.where(invalid, tl.full(s.shape, float("-inf"), dtype=tl.float32), s)
 
             # Recompute P from saved (m, l): P = exp(s - m_i) / l_i
             p = tl.exp(s - m[:, None]) / l[:, None]
