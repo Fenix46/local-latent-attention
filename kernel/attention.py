@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kernel.triton_local import sliding_window_triton_accum, HAS_TRITON
+
 
 # ──────────────────────────────────────────────────────────────────
 # Merge utilities — inline for speed
@@ -263,7 +265,9 @@ class HierarchicalAttention(nn.Module):
         v: torch.Tensor,
     ) -> torch.Tensor:     # (B, H, N, d)
         # ── Level 0: sliding window ──
-        m, l, o = _local_window_attention(
+        # Uses Triton fused kernel on CUDA, falls back to PyTorch on CPU.
+        # Returns unnormalised (m, l, o) accumulators for merge with upper levels.
+        m, l, o = sliding_window_triton_accum(
             q, k, v,
             window=self.local_W,
             gamma=self.gammas[0],
