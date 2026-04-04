@@ -441,23 +441,25 @@ def _hier_pytorch(
         o = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
         return m, l, o
 
-    q_pos     = torch.arange(N, device=device)
-    c_idx     = torch.arange(C, device=device)
+    acc_dtype = dtype if dtype == torch.float64 else torch.float32
+
+    q_pos     = torch.arange(N, device=device, dtype=acc_dtype)
+    c_idx     = torch.arange(C, device=device, dtype=acc_dtype)
     chunk_end = (c_idx + 1) * chunk_size
-    centroid  = c_idx.float() * chunk_size + chunk_size / 2.0
+    centroid  = c_idx * chunk_size + chunk_size / 2.0
 
     threshold = (q_pos - local_W + 1).clamp(min=0)
     mask      = chunk_end.unsqueeze(0) <= threshold.unsqueeze(1)   # (N, C)
-    dist      = (q_pos.float().unsqueeze(1) - centroid.unsqueeze(0)).abs().to(dtype)
+    dist      = (q_pos.unsqueeze(1) - centroid.unsqueeze(0)).abs()
 
     if not mask.any():
-        m = torch.full((B, H, N),    float("-inf"), device=device, dtype=dtype)
-        l = torch.zeros((B, H, N),                  device=device, dtype=dtype)
+        m = torch.full((B, H, N),    float("-inf"), device=device, dtype=acc_dtype)
+        l = torch.zeros((B, H, N),                  device=device, dtype=acc_dtype)
         o = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
         return m, l, o
 
-    scores = torch.matmul(q, k_c.transpose(-2, -1)) * scale
-    scores = scores - (gamma * dist).unsqueeze(0).unsqueeze(0)
+    scores = torch.matmul(q.to(acc_dtype), k_c.to(acc_dtype).transpose(-2, -1)) * scale
+    scores = scores - (gamma.to(acc_dtype) * dist).unsqueeze(0).unsqueeze(0)
     scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
     m_     = scores.amax(dim=-1)
@@ -466,7 +468,7 @@ def _hier_pytorch(
     exp_s  = exp_s.masked_fill(~mask.unsqueeze(0).unsqueeze(0), 0.0)
 
     l_ = exp_s.sum(dim=-1)
-    o_ = torch.matmul(exp_s, v_c)
+    o_ = torch.matmul(exp_s, v_c.to(acc_dtype)).to(dtype)
 
     no_key = ~mask.any(dim=-1)
     m_     = m_.masked_fill(no_key.unsqueeze(0).unsqueeze(0), float("-inf"))

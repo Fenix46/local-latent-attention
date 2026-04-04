@@ -23,10 +23,9 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from kernel.triton_local import sliding_window_triton_accum, HAS_TRITON
-from kernel.triton_hier import compressed_level_triton
+from kernel.triton_local import _sw_pytorch_accum
+from kernel.triton_hier import _hier_pytorch
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -48,153 +47,64 @@ def _merge(
 
 
 # ──────────────────────────────────────────────────────────────────
-# Level 0: sliding window via tiled SDPA
+# Helper: build K/V hierarchy (mean-pool per level)
 # ──────────────────────────────────────────────────────────────────
 
-def _local_window_attention(
-    q: torch.Tensor,       # (B, H, N, d)
-    k: torch.Tensor,       # (B, H, N, d)
-    v: torch.Tensor,       # (B, H, N, d)
-    window: int,
-    gamma: torch.Tensor,   # scalar parameter
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _build_hierarchy(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    chunk_B: int,
+    n_levels: int,
+) -> list:
+    """Mean-pool K,V into compressed levels. Returns list indexed by level.
+    Level 0 is None (uses raw k, v). Levels 1..n_levels are (k_l, v_l, n_chunks).
     """
-    Sliding-window attention with ALiBi bias.
-
-    Processes queries in blocks of size `window`. For each block of queries,
-    attends only to the corresponding window of keys — never materializing
-    the full N×N matrix.
-
-    Returns (m, l, o) accumulators with shape (B, H, N) / (B, H, N, d).
-    """
-    B, H, N, d = q.shape
-    device, dtype = q.device, q.dtype
-
-    m_out = torch.full((B, H, N),    float("-inf"), device=device, dtype=dtype)
-    l_out = torch.zeros((B, H, N),                  device=device, dtype=dtype)
-    o_out = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
-
-    # Precompute ALiBi distance offsets for a window of size `window`
-    # dist[i] = i  (query at offset i within window sees key at distance i..0)
-    offsets = torch.arange(window, device=device, dtype=dtype)  # (W,)
-
-    for q_start in range(0, N, window):
-        q_end   = min(q_start + window, N)
-        q_len   = q_end - q_start
-
-        k_start = max(0, q_start - window + 1)
-        k_end   = q_end                          # causal: key up to q_end-1
-        k_len   = k_end - k_start
-
-        q_blk = q[:, :, q_start:q_end, :]       # (B, H, q_len, d)
-        k_blk = k[:, :, k_start:k_end, :]       # (B, H, k_len, d)
-        v_blk = v[:, :, k_start:k_end, :]
-
-        # Raw scores
-        scores = torch.matmul(q_blk, k_blk.transpose(-2, -1)) * scale  # (B,H,q_len,k_len)
-
-        # ALiBi bias: distance = query_abs_pos - key_abs_pos
-        q_pos  = torch.arange(q_start, q_end, device=device, dtype=dtype)   # (q_len,)
-        k_pos  = torch.arange(k_start, k_end, device=device, dtype=dtype)   # (k_len,)
-        dist   = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).clamp(min=0)     # (q_len, k_len)
-        scores = scores - gamma * dist.unsqueeze(0).unsqueeze(0)
-
-        # Causal mask: key must be <= query position
-        causal = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)                    # (q_len, k_len)
-        scores = scores.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        # Window mask: key must be within W tokens of query
-        in_win = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)) < window         # (q_len, k_len)
-        scores = scores.masked_fill(~in_win.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        # Accumulator components
-        m_blk = scores.amax(dim=-1)                                          # (B, H, q_len)
-        m_safe = m_blk.clamp(min=-1e9)
-        exp_s = torch.exp(scores - m_safe.unsqueeze(-1))
-        valid = (~causal & in_win).unsqueeze(0).unsqueeze(0)
-        exp_s = exp_s.masked_fill(~valid, 0.0)
-
-        l_blk = exp_s.sum(dim=-1)                                            # (B, H, q_len)
-        o_blk = torch.matmul(exp_s, v_blk)                                  # (B, H, q_len, d)
-
-        # Rows with no valid key → keep m as -inf
-        no_key = ~valid.any(dim=-1)                                          # (1,1,q_len)
-        m_blk  = m_blk.masked_fill(no_key, float("-inf"))
-
-        m_out[:, :, q_start:q_end] = m_blk
-        l_out[:, :, q_start:q_end] = l_blk
-        o_out[:, :, q_start:q_end] = o_blk
-
-    return m_out, l_out, o_out
+    hierarchy: list = [None]
+    k_cur, v_cur = k, v
+    for _ in range(1, n_levels + 1):
+        _, _, N_cur, d = k_cur.shape
+        n_chunks = N_cur // chunk_B
+        if n_chunks == 0:
+            hierarchy.append(None)
+            continue
+        usable  = n_chunks * chunk_B
+        k_level = k_cur[:, :, :usable, :].view(*k_cur.shape[:2], n_chunks, chunk_B, d).mean(dim=3)
+        v_level = v_cur[:, :, :usable, :].view(*v_cur.shape[:2], n_chunks, chunk_B, d).mean(dim=3)
+        hierarchy.append((k_level, v_level, n_chunks))
+        k_cur, v_cur = k_level, v_level
+    return hierarchy
 
 
 # ──────────────────────────────────────────────────────────────────
-# Compressed levels
+# Differentiable forward — autograd handles the backward exactly
 # ──────────────────────────────────────────────────────────────────
 
-def _compressed_level_attention(
-    q: torch.Tensor,          # (B, H, N, d)
-    k_c: torch.Tensor,        # (B, H, C, d)  compressed keys
-    v_c: torch.Tensor,        # (B, H, C, d)  compressed values
-    chunk_size: int,
-    local_W: int,
-    gamma: torch.Tensor,      # scalar
-    scale: float,
-    mask_cache: dict,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _hierarchical_forward_pytorch(q, k, v, gammas, local_W, chunk_B, n_levels, scale):
     """
-    Attention from all N queries to C compressed chunks.
-
-    Chunk c covers tokens [c*chunk_size, (c+1)*chunk_size).
-    Query i can attend to chunk c iff:
-      (c+1)*chunk_size <= i          (fully in the past)
-      AND (c+1)*chunk_size <= i - local_W + 1  (outside local window)
-
-    Memory: O(N·C) where C = N/chunk_size — for large chunk_size this is small.
+    Pure-PyTorch differentiable forward. Used for backward via autograd.
+    The Triton kernels accelerate the forward pass but their custom backwards
+    are removed — autograd differentiates through this instead.
     """
-    B, H, N, d = q.shape
-    C = k_c.shape[2]
-    device, dtype = q.device, q.dtype
+    gammas_c = gammas.to(q.dtype)
 
-    cache_key = (N, C, chunk_size, local_W, device)
-    if cache_key not in mask_cache:
-        q_pos      = torch.arange(N, device=device)
-        c_idx      = torch.arange(C, device=device)
-        chunk_end  = (c_idx + 1) * chunk_size                              # (C,)
-        centroid   = c_idx.float() * chunk_size + chunk_size / 2.0         # (C,)
+    # Level 0: sliding window
+    m, l, o = _sw_pytorch_accum(q, k, v, local_W, gammas_c[0], scale)
+    m = m.to(q.dtype); l = l.to(q.dtype)
 
-        causal     = chunk_end.unsqueeze(0) <= q_pos.unsqueeze(1)          # (N, C)
-        non_local  = chunk_end.unsqueeze(0) <= (q_pos - local_W + 1).clamp(min=0).unsqueeze(1)
-        mask       = causal & non_local                                     # (N, C)
-        dist       = (q_pos.float().unsqueeze(1) - centroid.unsqueeze(0)).abs()  # (N, C)
-        mask_cache[cache_key] = (mask, dist.to(dtype))
+    # Levels 1..n_levels
+    hierarchy = _build_hierarchy(k, v, chunk_B, n_levels)
+    for lvl in range(1, n_levels + 1):
+        entry = hierarchy[lvl]
+        if entry is None:
+            continue
+        k_l, v_l, _ = entry
+        chunk_size = chunk_B ** lvl
+        m_l, l_l, o_l = _hier_pytorch(q, k_l, v_l, chunk_size, local_W, gammas_c[lvl], scale)
+        m_l = m_l.to(q.dtype); l_l = l_l.to(q.dtype)
+        m, l, o = _merge(m, l, o, m_l, l_l, o_l)
 
-    mask, dist = mask_cache[cache_key]
-
-    if not mask.any():
-        m = torch.full((B, H, N),    float("-inf"), device=device, dtype=dtype)
-        l = torch.zeros((B, H, N),                  device=device, dtype=dtype)
-        o = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
-        return m, l, o
-
-    # Scores: (B, H, N, C)
-    scores = torch.matmul(q, k_c.transpose(-2, -1)) * scale
-    scores = scores - (gamma * dist).unsqueeze(0).unsqueeze(0)
-    scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-    m = scores.amax(dim=-1)
-    m_safe = m.clamp(min=-1e9)
-    exp_s = torch.exp(scores - m_safe.unsqueeze(-1))
-    exp_s = exp_s.masked_fill(~mask.unsqueeze(0).unsqueeze(0), 0.0)
-
-    l = exp_s.sum(dim=-1)
-    o = torch.matmul(exp_s, v_c)
-
-    no_key = ~mask.any(dim=-1)
-    m = m.masked_fill(no_key.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-    return m, l, o
+    l_safe = l.clamp(min=1e-8)
+    return o / l_safe.unsqueeze(-1)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -237,67 +147,20 @@ class HierarchicalAttention(nn.Module):
         )
         self.gammas = nn.Parameter(gammas)   # (n_levels+1,)
 
-    def _build_hierarchy(
-        self,
-        k: torch.Tensor,   # (B, H, N, d)
-        v: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor, int] | None]:
-        """Mean-pool K,V into compressed levels. Returns list indexed by level."""
-        B = self.chunk_B
-        hierarchy: list = [None]   # level 0 uses raw k, v
-
-        k_cur, v_cur = k, v
-        for _ in range(1, self.n_levels + 1):
-            _, _, N_cur, d = k_cur.shape
-            n_chunks = N_cur // B
-            if n_chunks == 0:
-                hierarchy.append(None)
-                continue
-            usable  = n_chunks * B
-            k_level = k_cur[:, :, :usable, :].view(*k_cur.shape[:2], n_chunks, B, d).mean(dim=3)
-            v_level = v_cur[:, :, :usable, :].view(*v_cur.shape[:2], n_chunks, B, d).mean(dim=3)
-            hierarchy.append((k_level, v_level, n_chunks))
-            k_cur, v_cur = k_level, v_level
-
-        return hierarchy
-
     def forward(
         self,
         q: torch.Tensor,   # (B, H, N, d)
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:     # (B, H, N, d)
-        # ── Level 0: sliding window ──
-        # Uses Triton fused kernel on CUDA, falls back to PyTorch on CPU.
-        # Returns unnormalised (m, l, o) accumulators for merge with upper levels.
-        m, l, o = sliding_window_triton_accum(
+        return _hierarchical_forward_pytorch(
             q, k, v,
-            window=self.local_W,
-            gamma=self.gammas[0],
-            scale=self.scale,
+            self.gammas,
+            self.local_W,
+            self.chunk_B,
+            self.n_levels,
+            self.scale,
         )
-
-        # ── Levels 1..n_levels: compressed chunks ──
-        hierarchy = self._build_hierarchy(k, v)
-
-        for lvl in range(1, self.n_levels + 1):
-            entry = hierarchy[lvl]
-            if entry is None:
-                continue
-            k_l, v_l, _ = entry
-            chunk_size = self.chunk_B ** lvl
-
-            m_l, l_l, o_l = compressed_level_triton(
-                q, k_l, v_l,
-                chunk_size = chunk_size,
-                local_W    = self.local_W,
-                gamma      = self.gammas[lvl],
-                scale      = self.scale,
-            )
-            m, l, o = _merge(m, l, o, m_l, l_l, o_l)
-
-        # ── Output ──
-        return o / l.to(o.dtype).clamp(min=1e-8).unsqueeze(-1)
 
 
 # ──────────────────────────────────────────────────────────────────

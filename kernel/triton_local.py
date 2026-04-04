@@ -481,9 +481,11 @@ def _sw_pytorch_accum(
     """Pure-PyTorch reference for CPU / non-Triton environments."""
     B, H, N, d = q.shape
     device, dtype = q.device, q.dtype
+    # Use at least float32 for accumulators; preserve float64 if input is float64.
+    acc_dtype = dtype if dtype == torch.float64 else torch.float32
 
-    m_out = torch.full((B, H, N),    float("-inf"), device=device, dtype=dtype)
-    l_out = torch.zeros((B, H, N),                  device=device, dtype=dtype)
+    m_out = torch.full((B, H, N),    float("-inf"), device=device, dtype=acc_dtype)
+    l_out = torch.zeros((B, H, N),                  device=device, dtype=acc_dtype)
     o_out = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
 
     for q_start in range(0, N, window):
@@ -495,12 +497,12 @@ def _sw_pytorch_accum(
         k_blk = k[:, :, k_start:k_end, :]
         v_blk = v[:, :, k_start:k_end, :]
 
-        scores = torch.matmul(q_blk, k_blk.transpose(-2, -1)) * scale
+        scores = torch.matmul(q_blk.to(acc_dtype), k_blk.to(acc_dtype).transpose(-2, -1)) * scale
 
-        q_pos = torch.arange(q_start, q_end, device=device, dtype=dtype)
-        k_pos = torch.arange(k_start, k_end, device=device, dtype=dtype)
+        q_pos = torch.arange(q_start, q_end, device=device, dtype=acc_dtype)
+        k_pos = torch.arange(k_start, k_end, device=device, dtype=acc_dtype)
         dist  = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).clamp(min=0)
-        scores = scores - gamma * dist.unsqueeze(0).unsqueeze(0)
+        scores = scores - gamma.to(acc_dtype) * dist.unsqueeze(0).unsqueeze(0)
 
         causal  = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)
         in_win  = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)) < window
@@ -513,7 +515,7 @@ def _sw_pytorch_accum(
         exp_s  = exp_s.masked_fill(invalid.unsqueeze(0).unsqueeze(0), 0.0)
 
         l_blk = exp_s.sum(dim=-1)
-        o_blk = torch.matmul(exp_s, v_blk)
+        o_blk = torch.matmul(exp_s, v_blk.to(acc_dtype)).to(dtype)
 
         no_key = ~(~invalid).any(dim=-1)
         m_blk  = m_blk.masked_fill(no_key.unsqueeze(0).unsqueeze(0), float("-inf"))
