@@ -24,8 +24,8 @@ import math
 import torch
 import torch.nn as nn
 
-from kernel.triton_local import _sw_pytorch_accum
-from kernel.triton_hier import _hier_pytorch
+from kernel.triton_local import _sw_pytorch_accum, sliding_window_triton_accum, HAS_TRITON
+from kernel.triton_hier import _hier_pytorch, compressed_level_triton, _check_hier_triton
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -78,6 +78,72 @@ def _build_hierarchy(
 # ──────────────────────────────────────────────────────────────────
 # Differentiable forward — autograd handles the backward exactly
 # ──────────────────────────────────────────────────────────────────
+
+def _hierarchical_forward_triton(q, k, v, gammas, local_W, chunk_B, n_levels, scale):
+    """
+    Triton-accelerated forward (inference-only speed path).
+    Same math as _hierarchical_forward_pytorch but uses fused kernels.
+    NOT used directly — called from _TritonForwardFn which handles autograd.
+    """
+    gammas_c = gammas.to(q.dtype)
+
+    m, l, o = sliding_window_triton_accum(q, k, v, window=local_W, gamma=gammas_c[0], scale=scale)
+    m = m.to(q.dtype); l = l.to(q.dtype)
+
+    hierarchy = _build_hierarchy(k, v, chunk_B, n_levels)
+    for lvl in range(1, n_levels + 1):
+        entry = hierarchy[lvl]
+        if entry is None:
+            continue
+        k_l, v_l, _ = entry
+        chunk_size = chunk_B ** lvl
+        m_l, l_l, o_l = compressed_level_triton(q, k_l, v_l, chunk_size, local_W, gammas_c[lvl], scale)
+        m_l = m_l.to(q.dtype); l_l = l_l.to(q.dtype)
+        m, l, o = _merge(m, l, o, m_l, l_l, o_l)
+
+    l_safe = l.clamp(min=1e-8)
+    return o / l_safe.unsqueeze(-1)
+
+
+class _TritonForwardFn(torch.autograd.Function):
+    """
+    Forward: runs Triton-fused kernels (fast).
+    Backward: recomputes via pure-PyTorch forward and lets autograd
+              differentiate it exactly — no custom backward needed.
+
+    This gives Triton speed on the forward pass while keeping a
+    mathematically correct backward with zero extra implementation cost.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, gammas, local_W, chunk_B, n_levels, scale):
+        ctx.save_for_backward(q, k, v, gammas)
+        ctx.local_W  = local_W
+        ctx.chunk_B  = chunk_B
+        ctx.n_levels = n_levels
+        ctx.scale    = scale
+        with torch.no_grad():
+            return _hierarchical_forward_triton(q, k, v, gammas, local_W, chunk_B, n_levels, scale)
+
+    @staticmethod
+    def backward(ctx, d_out):
+        q, k, v, gammas = ctx.saved_tensors
+        local_W  = ctx.local_W
+        chunk_B  = ctx.chunk_B
+        n_levels = ctx.n_levels
+        scale    = ctx.scale
+
+        # Recompute forward through PyTorch — autograd builds the graph here
+        with torch.enable_grad():
+            q2 = q.detach().requires_grad_(True)
+            k2 = k.detach().requires_grad_(True)
+            v2 = v.detach().requires_grad_(True)
+            g2 = gammas.detach().requires_grad_(True)
+            out = _hierarchical_forward_pytorch(q2, k2, v2, g2, local_W, chunk_B, n_levels, scale)
+            out.backward(d_out)
+
+        return q2.grad, k2.grad, v2.grad, g2.grad, None, None, None, None
+
 
 def _hierarchical_forward_pytorch(q, k, v, gammas, local_W, chunk_B, n_levels, scale):
     """
@@ -153,6 +219,15 @@ class HierarchicalAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:     # (B, H, N, d)
+        if q.is_cuda and HAS_TRITON and _check_hier_triton():
+            return _TritonForwardFn.apply(
+                q, k, v,
+                self.gammas,
+                self.local_W,
+                self.chunk_B,
+                self.n_levels,
+                self.scale,
+            )
         return _hierarchical_forward_pytorch(
             q, k, v,
             self.gammas,
