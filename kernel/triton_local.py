@@ -477,47 +477,73 @@ def _sw_pytorch_accum(
     window: int,
     gamma: torch.Tensor,
     scale: float,
+    q_block: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference for CPU / non-Triton environments."""
+    """
+    Vectorized sliding-window attention accumulators.
+
+    Processes queries in blocks of `q_block` (default 256) — the Python loop
+    runs ceil(N / q_block) times instead of ceil(N / window) times, dramatically
+    reducing overhead when window << q_block.
+
+    Within each block, uses gather to extract the W-wide key window for every
+    query in the block simultaneously, then computes scores in a single batched
+    operation. This is torch.compile-friendly and GPU-parallel.
+
+    Memory per block: O(B·H·q_block·W·d) — controlled, no N² allocation.
+    """
     B, H, N, d = q.shape
     device, dtype = q.device, q.dtype
-    # Use at least float32 for accumulators; preserve float64 if input is float64.
     acc_dtype = dtype if dtype == torch.float64 else torch.float32
+
+    offsets = torch.arange(window, device=device)   # (W,)
 
     m_out = torch.full((B, H, N),    float("-inf"), device=device, dtype=acc_dtype)
     l_out = torch.zeros((B, H, N),                  device=device, dtype=acc_dtype)
     o_out = torch.zeros((B, H, N, d),               device=device, dtype=dtype)
 
-    for q_start in range(0, N, window):
-        q_end   = min(q_start + window, N)
-        k_start = max(0, q_start - window + 1)
-        k_end   = q_end
+    for q_start in range(0, N, q_block):
+        q_end  = min(q_start + q_block, N)
+        Q      = q_end - q_start          # actual block size
 
-        q_blk = q[:, :, q_start:q_end, :]
-        k_blk = k[:, :, k_start:k_end, :]
-        v_blk = v[:, :, k_start:k_end, :]
+        q_pos  = torch.arange(q_start, q_end, device=device)   # (Q,)
 
-        scores = torch.matmul(q_blk.to(acc_dtype), k_blk.to(acc_dtype).transpose(-2, -1)) * scale
+        # Gather indices: for each query i in [q_start, q_end), key positions [i-W+1, i]
+        # k_idx[i, w] = clamp(i - W + 1 + w, 0, N-1) — shape (Q, W)
+        real_k = q_pos.unsqueeze(1) - window + 1 + offsets.unsqueeze(0)   # (Q, W)
+        k_idx  = real_k.clamp(0, N - 1)
 
-        q_pos = torch.arange(q_start, q_end, device=device, dtype=acc_dtype)
-        k_pos = torch.arange(k_start, k_end, device=device, dtype=acc_dtype)
-        dist  = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).clamp(min=0)
+        # invalid: clamped indices that are out of the valid range
+        invalid = (real_k < 0) | (real_k > q_pos.unsqueeze(1))   # (Q, W)
+
+        # Gather K, V: (B, H, Q, W, d)
+        idx_exp = k_idx.view(1, 1, Q, window, 1).expand(B, H, Q, window, d)
+        k_flat  = k.gather(2, idx_exp.reshape(B, H, Q * window, d))
+        k_win   = k_flat.reshape(B, H, Q, window, d)
+        v_flat  = v.gather(2, idx_exp.reshape(B, H, Q * window, d))
+        v_win   = v_flat.reshape(B, H, Q, window, d)
+
+        # Scores: (B, H, Q, W)
+        q_blk  = q[:, :, q_start:q_end, :]   # (B, H, Q, d)
+        scores = (q_blk.unsqueeze(3).to(acc_dtype) * k_win.to(acc_dtype)).sum(-1) * scale
+
+        # ALiBi bias
+        dist   = (q_pos.unsqueeze(1) - real_k.clamp(0)).to(acc_dtype).clamp(min=0)   # (Q, W)
         scores = scores - gamma.to(acc_dtype) * dist.unsqueeze(0).unsqueeze(0)
 
-        causal  = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)
-        in_win  = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)) < window
-        invalid = causal | ~in_win
-        scores  = scores.masked_fill(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
+        # Mask
+        scores = scores.masked_fill(invalid.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        m_blk  = scores.amax(dim=-1)
+        # Softmax accumulators
+        m_blk  = scores.amax(dim=-1)                   # (B, H, Q)
         m_safe = m_blk.clamp(min=-1e9)
         exp_s  = torch.exp(scores - m_safe.unsqueeze(-1))
         exp_s  = exp_s.masked_fill(invalid.unsqueeze(0).unsqueeze(0), 0.0)
 
-        l_blk = exp_s.sum(dim=-1)
-        o_blk = torch.matmul(exp_s, v_blk.to(acc_dtype)).to(dtype)
+        l_blk = exp_s.sum(dim=-1)                       # (B, H, Q)
+        o_blk = (exp_s.to(acc_dtype).unsqueeze(-1) * v_win.to(acc_dtype)).sum(dim=3).to(dtype)
 
-        no_key = ~(~invalid).any(dim=-1)
+        no_key = invalid.all(dim=-1)   # (Q,)
         m_blk  = m_blk.masked_fill(no_key.unsqueeze(0).unsqueeze(0), float("-inf"))
 
         m_out[:, :, q_start:q_end] = m_blk
