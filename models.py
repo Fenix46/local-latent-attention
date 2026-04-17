@@ -524,9 +524,16 @@ class LocalLatentLM(nn.Module):
         (those that feed directly into a residual stream) are additionally
         scaled by 1/sqrt(2*n_layers) so the residual stream variance stays
         O(1) regardless of depth — prevents the loss-630 explosion at init.
+
+        lm_head is skipped because its weight is tied to self.embedding
+        (same storage).  Initialising it would either overwrite the embedding
+        init a second time (duplicate work) or, worse, apply the output-proj
+        rescaling to the embedding tensor by accident.
         """
         output_projs = {"out", "r_out", "w2"}   # names of output projections
         for name, module in self.named_modules():
+            if module is self.lm_head:
+                continue
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:

@@ -186,11 +186,24 @@ class BinTextTaskConfig:
     seed: int = 0
 
 
-class BinTextDataset:
-    """Memory-mapped dataset over a pre-tokenized .bin file.
+class BinTextDataset(torch.utils.data.Dataset):
+    """Memory-mapped, map-style dataset over a pre-tokenized .bin file.
 
     Supports vocab sizes up to 2^32-1.  Uses uint16 storage for vocab ≤ 65535,
     uint32 otherwise — must match how the file was written.
+
+    Indexing model
+    --------------
+    The token stream is partitioned into non-overlapping windows of length
+    `seq_len + 1` (inputs and shifted targets).  Each `__getitem__(idx)`
+    returns the window starting at `idx * seq_len`.  This makes the dataset
+    compatible with `DistributedSampler`, `RandomSampler`, and any DataLoader
+    worker setup, and guarantees no rank sees the same training tokens.
+
+    The legacy `sample_batch(batch_size, device)` method is kept as a shim
+    for single-process use; it samples `batch_size` random indices via an
+    internal RNG.  Under DDP you should not use it — drive the dataset
+    through a DataLoader + DistributedSampler instead.
     """
 
     def __init__(self, config: BinTextTaskConfig) -> None:
@@ -198,6 +211,7 @@ class BinTextDataset:
         self.vocab_size = config.vocab_size
         self.bits_metric_name = "eval_bpt"
         self.tokenizer_kind = "pretokenized"
+        # Legacy sample_batch RNG; DistributedSampler has its own generator.
         self.rng = random.Random(config.seed)
 
         self._dtype = torch.uint16 if config.vocab_size <= 65535 else torch.uint32
@@ -210,9 +224,8 @@ class BinTextDataset:
             size=num_tokens,
             dtype=self._dtype,
         )
-        # NOTE: no .long() here — we stay in uint16/uint32 to avoid copying
-        # the entire corpus into RAM. The cast to long happens per-batch in
-        # sample_batch(), only on the small slices we actually need.
+        # NOTE: stay in uint16/uint32 here — the cast to long is deferred to
+        # per-window __getitem__ so the full corpus never materialises as int64.
 
         min_tokens = config.seq_len + 1
         if all_tokens.numel() < min_tokens * 2:
@@ -236,10 +249,36 @@ class BinTextDataset:
                 f"split '{config.split}' too small: got {self.tokens.numel()} tokens"
             )
 
+        # Non-overlapping windows.  We need seq_len input tokens plus one
+        # more for the shifted target, so the last legal start is
+        # numel - seq_len - 1.  Integer-dividing by seq_len gives the count.
+        self._window_count = (self.tokens.numel() - 1) // self.config.seq_len
+        if self._window_count <= 0:
+            raise ValueError(
+                f"split '{config.split}' produced zero windows for seq_len={self.config.seq_len}"
+            )
+
+    # ── map-style Dataset API ────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return self._window_count
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if idx < 0 or idx >= self._window_count:
+            raise IndexError(idx)
+        start = idx * self.config.seq_len
+        end = start + self.config.seq_len
+        # Cast to long only on the small slices — no full-corpus copy.
+        x = self.tokens[start:end].long()
+        y = self.tokens[start + 1 : end + 1].long()
+        return x, y
+
+    # ── legacy sampling shim (single-process only) ───────────────────────
+
     def sample_batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Random-access batch sampler. Prefer DataLoader+DistributedSampler under DDP."""
         max_start = self.tokens.numel() - self.config.seq_len - 1
         starts = [self.rng.randint(0, max_start) for _ in range(batch_size)]
-        # Cast to long only on the small slices — no full-corpus copy.
         inputs  = [self.tokens[s : s + self.config.seq_len].long()     for s in starts]
         targets = [self.tokens[s + 1 : s + self.config.seq_len + 1].long() for s in starts]
         x = torch.stack(inputs).to(device=device)
