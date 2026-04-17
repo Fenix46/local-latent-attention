@@ -1,205 +1,290 @@
-"""
-Inference / text generation for TelescopicAttention LM.
-
-Usage:
-  python generate.py \
-    --checkpoint checkpoints/step_20000.pt \
-    --tokenizer /opt/algoritmo/runs/tokenizers/fineweb_spm_32k.model \
-    --prompt "The history of artificial intelligence" \
-    --max-tokens 200 \
-    --temperature 0.8 \
-    --top-p 0.9
-"""
-
-from __future__ import annotations
 import argparse
 import json
-import torch
-import torch.nn.functional as F
 from pathlib import Path
 
-from model import ModelConfig, HierarchicalLM
+import torch
+
+from models import build_model
+from runtime import resolve_device
+from tokenizers import load_text_tokenizer
 
 
-# ──────────────────────────────────────────
-# Tokenizer wrapper
-# ──────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--prompt", type=str, default="")
+    parser.add_argument("--prompt-file", type=Path, default=None)
+    parser.add_argument(
+        "--tokenizer-model",
+        type=Path,
+        default=None,
+        help="Optional SentencePiece .model override. Required for --task bin checkpoints unless it was saved in the checkpoint config.",
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--repetition-penalty", type=float, default=1.1)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=3)
+    parser.add_argument("--disable-eos-stop", action="store_true")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--dtype", choices=["auto", "float32", "bfloat16", "float16"], default="auto")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-file", type=Path, default=None)
+    return parser.parse_args()
 
-class SPTokenizer:
-    def __init__(self, model_path: str | Path) -> None:
-        import sentencepiece as spm
-        self.sp = spm.SentencePieceProcessor()
-        self.sp.Load(str(model_path))
 
-    def encode(self, text: str) -> list[int]:
-        return self.sp.EncodeAsIds(text)
-
-    def decode(self, ids: list[int]) -> str:
-        return self.sp.DecodeIds(ids)
-
-    @property
-    def vocab_size(self) -> int:
-        return self.sp.GetPieceSize()
+def load_prompt(args: argparse.Namespace) -> str:
+    if args.prompt_file is not None:
+        return args.prompt_file.read_text(encoding="utf-8")
+    return args.prompt
 
 
-# ──────────────────────────────────────────
-# Sampling
-# ──────────────────────────────────────────
+def filter_logits(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    if top_k <= 0 or top_k >= logits.size(-1):
+        return logits
+    values, _ = torch.topk(logits, k=top_k, dim=-1)
+    threshold = values[..., -1, None]
+    return logits.masked_fill(logits < threshold, float("-inf"))
 
-def sample_token(
-    logits: torch.Tensor,   # (vocab_size,)
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    generated_ids: torch.Tensor,
+    repetition_penalty: float,
+) -> torch.Tensor:
+    if repetition_penalty <= 1.0 or generated_ids.numel() == 0:
+        return logits
+
+    adjusted = logits.clone()
+    seen_tokens = torch.unique(generated_ids)
+    seen_logits = adjusted[..., seen_tokens]
+    adjusted[..., seen_tokens] = torch.where(
+        seen_logits < 0,
+        seen_logits * repetition_penalty,
+        seen_logits / repetition_penalty,
+    )
+    return adjusted
+
+
+def banned_ngram_tokens(token_ids: list[int], ngram_size: int) -> set[int]:
+    if ngram_size <= 0 or len(token_ids) < ngram_size - 1:
+        return set()
+
+    prefix = tuple(token_ids[-(ngram_size - 1) :]) if ngram_size > 1 else tuple()
+    banned: set[int] = set()
+    limit = len(token_ids) - ngram_size + 1
+    for idx in range(max(0, limit)):
+        ngram = token_ids[idx : idx + ngram_size]
+        if tuple(ngram[:-1]) == prefix:
+            banned.add(ngram[-1])
+    return banned
+
+
+def sample_next_token(
+    logits: torch.Tensor,
     temperature: float,
-    top_p: float,
     top_k: int,
-) -> int:
-    if temperature == 0.0:
-        return logits.argmax().item()
+    generated_ids: torch.Tensor,
+    repetition_penalty: float,
+    banned_tokens: set[int],
+) -> torch.Tensor:
+    adjusted = apply_repetition_penalty(
+        logits,
+        generated_ids=generated_ids,
+        repetition_penalty=repetition_penalty,
+    )
+    if banned_tokens:
+        banned = torch.tensor(sorted(banned_tokens), device=adjusted.device, dtype=torch.long)
+        adjusted[..., banned] = float("-inf")
 
-    logits = logits / temperature
+    if temperature <= 0.0:
+        return adjusted.argmax(dim=-1, keepdim=True)
 
-    # Top-k
-    if top_k > 0:
-        top_k = min(top_k, logits.size(-1))
-        kth = torch.topk(logits, top_k).values[-1]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
-
-    # Top-p (nucleus)
-    if top_p < 1.0:
-        probs = torch.softmax(logits, dim=-1)
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumprobs = torch.cumsum(sorted_probs, dim=-1)
-        # Remove tokens where cumulative prob exceeds top_p
-        remove = cumprobs - sorted_probs > top_p
-        sorted_probs[remove] = 0.0
-        sorted_probs /= sorted_probs.sum()
-        token = sorted_idx[torch.multinomial(sorted_probs, 1)].item()
-    else:
-        probs = torch.softmax(logits, dim=-1)
-        token = torch.multinomial(probs, 1).item()
-
-    return token
+    scaled = adjusted / temperature
+    filtered = filter_logits(scaled, top_k=top_k)
+    probs = torch.softmax(filtered, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
-# ──────────────────────────────────────────
-# Load model from checkpoint
-# ──────────────────────────────────────────
+def parse_dtype(name: str) -> torch.dtype:
+    return {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[name]
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[HierarchicalLM, ModelConfig]:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config = ModelConfig(**ckpt["config"])
-    model = HierarchicalLM(config)
-    model.load_state_dict(ckpt["model"])
-    model.to(device)
+
+def infer_checkpoint_dtype(checkpoint: dict) -> torch.dtype:
+    state_dict = checkpoint["model_state_dict"]
+    for tensor in state_dict.values():
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
+def resolve_inference_dtype(args: argparse.Namespace, device: torch.device, checkpoint: dict) -> torch.dtype:
+    if args.dtype != "auto":
+        return parse_dtype(args.dtype)
+
+    checkpoint_dtype = infer_checkpoint_dtype(checkpoint)
+    if device.type == "cuda" and checkpoint_dtype in {torch.float16, torch.bfloat16}:
+        return checkpoint_dtype
+    return torch.float32
+
+
+def build_model_from_checkpoint(
+    checkpoint: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.nn.Module:
+    config = checkpoint["config"]
+    task = config.get("task")
+    if task not in {"text", "bin"}:
+        raise ValueError(
+            "prototype.generate currently supports only checkpoints trained with --task text or --task bin"
+        )
+
+    model = build_model(
+        vocab_size=config.get("vocab_size", 256),
+        max_seq_len=config["seq_len"],
+        d_model=config["d_model"],
+        n_heads=config["n_heads"],
+        n_layers=config["n_layers"],
+        d_ff=config["d_ff"],
+        local_window=config["local_window"],
+        local_block_size=config["local_block_size"],
+        latent_tokens=config["latent_tokens"],
+        latent_d_model=config["latent_d_model"],
+        latent_heads=config["latent_heads"],
+        latent_query_block_size=config.get("latent_query_block_size", 0),
+        checkpoint_blocks=config.get("checkpoint_blocks", False),
+        use_triton_kernel=config.get("use_triton_kernel", False),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device=device, dtype=dtype)
     model.eval()
-    return model, config
+    return model
 
-
-# ──────────────────────────────────────────
-# Generation loop
-# ──────────────────────────────────────────
 
 @torch.no_grad()
 def generate(
-    model: HierarchicalLM,
-    tokenizer: SPTokenizer,
-    prompt: str,
-    max_tokens: int,
+    model: torch.nn.Module,
+    prompt_token_ids: list[int],
+    max_new_tokens: int,
     temperature: float,
-    top_p: float,
     top_k: int,
+    repetition_penalty: float,
+    no_repeat_ngram_size: int,
+    eos_token_id: int | None,
+    stop_on_eos: bool,
     device: torch.device,
-    bf16: bool,
-) -> str:
-    input_ids = tokenizer.encode(prompt)
-    if not input_ids:
-        raise ValueError("Prompt encodes to empty sequence")
+) -> list[int]:
+    if len(prompt_token_ids) == 0:
+        raise ValueError("prompt_token_ids must not be empty")
 
-    ids = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)  # (1, seq)
+    input_ids = torch.tensor(prompt_token_ids, dtype=torch.long, device=device).unsqueeze(0)
+    max_seq_len = model.config.max_seq_len
 
-    generated = []
-    for _ in range(max_tokens):
-        # Truncate context to avoid OOM on very long sequences
-        # Use last local_W * 4 tokens as context (safe heuristic)
-        max_ctx = model.config.local_W * 4
-        ctx = ids[:, -max_ctx:] if ids.size(1) > max_ctx else ids
+    for _ in range(max_new_tokens):
+        context = input_ids[:, -max_seq_len:]
+        logits = model(context)
+        banned_tokens = banned_ngram_tokens(input_ids[0].tolist(), no_repeat_ngram_size)
+        next_token = sample_next_token(
+            logits[:, -1, :],
+            temperature=temperature,
+            top_k=top_k,
+            generated_ids=input_ids[0],
+            repetition_penalty=repetition_penalty,
+            banned_tokens=banned_tokens,
+        )
+        input_ids = torch.cat([input_ids, next_token], dim=1)
+        if stop_on_eos and eos_token_id is not None and next_token.item() == eos_token_id:
+            break
 
-        if bf16:
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits = model(ctx)
-        else:
-            logits = model(ctx)
-
-        next_logits = logits[0, -1, :]   # (vocab_size,)
-        next_token = sample_token(next_logits, temperature, top_p, top_k)
-
-        generated.append(next_token)
-        ids = torch.cat([ids, torch.tensor([[next_token]], device=device)], dim=1)
-
-    return tokenizer.decode(input_ids + generated)
+    return input_ids[0].tolist()
 
 
-# ──────────────────────────────────────────
-# Args
-# ──────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint",   type=Path, required=True)
-    p.add_argument("--tokenizer",    type=Path, required=True)
-    p.add_argument("--prompt",       type=str,  default="The")
-    p.add_argument("--max-tokens",   type=int,  default=200)
-    p.add_argument("--temperature",  type=float, default=0.8)
-    p.add_argument("--top-p",        type=float, default=0.9)
-    p.add_argument("--top-k",        type=int,  default=50)
-    p.add_argument("--bf16",         action="store_true")
-    p.add_argument("--device",       default="auto")
-    p.add_argument("--n-samples",    type=int,  default=1)
-    return p.parse_args()
+def resolve_eos_token_id(tokenizer) -> int | None:
+    processor = getattr(tokenizer, "processor", None)
+    if processor is None:
+        return None
+    eos_id = int(processor.eos_id())
+    return eos_id if eos_id >= 0 else None
 
 
-# ──────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────
+def resolve_generation_tokenizer(config: dict, tokenizer_model_override: Path | None = None):
+    tokenizer_model = tokenizer_model_override
+    if tokenizer_model is None and config.get("tokenizer_model"):
+        tokenizer_model = Path(config["tokenizer_model"])
+
+    if tokenizer_model is not None:
+        return load_text_tokenizer(tokenizer_model)
+
+    if config.get("task") == "text":
+        return load_text_tokenizer(None)
+
+    if config.get("task") == "bin":
+        raise ValueError(
+            "this checkpoint was trained with --task bin, but no tokenizer model is stored in the checkpoint. "
+            "Pass --tokenizer-model with the same SentencePiece .model used to create the .bin dataset."
+        )
+
+    raise ValueError(f"unsupported checkpoint task for tokenizer resolution: {config.get('task')!r}")
+
 
 def main() -> None:
     args = parse_args()
+    torch.manual_seed(args.seed)
+    device = resolve_device(args.device)
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else
-                              "mps"  if torch.backends.mps.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    inference_dtype = resolve_inference_dtype(args, device=device, checkpoint=checkpoint)
+    model = build_model_from_checkpoint(checkpoint, device=device, dtype=inference_dtype)
+    config = checkpoint["config"]
+    tokenizer = resolve_generation_tokenizer(config, tokenizer_model_override=args.tokenizer_model)
+    eos_token_id = resolve_eos_token_id(tokenizer)
+    checkpoint.pop("optimizer_state_dict", None)
+    checkpoint.pop("metrics", None)
+    prompt = load_prompt(args)
+    prompt_token_ids = tokenizer.encode_text(prompt if prompt else "Once upon a time")
+    generated_ids = generate(
+        model=model,
+        prompt_token_ids=prompt_token_ids,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        eos_token_id=eos_token_id,
+        stop_on_eos=not args.disable_eos_stop,
+        device=device,
+    )
+    text = tokenizer.decode_ids(generated_ids)
 
-    print(f"Loading model from {args.checkpoint}...")
-    model, config = load_model(args.checkpoint, device)
-    n_params = model.count_parameters()
-    print(f"Model loaded: {n_params:,} params, device={device}")
-    print(json.dumps(config.__dict__, indent=2))
-
-    print(f"\nLoading tokenizer from {args.tokenizer}...")
-    tokenizer = SPTokenizer(args.tokenizer)
-    print(f"Vocab size: {tokenizer.vocab_size}")
-
-    print(f"\nPrompt: {args.prompt!r}")
-    print(f"Generating {args.max_tokens} tokens × {args.n_samples} sample(s)...\n")
-    print("─" * 60)
-
-    for i in range(args.n_samples):
-        text = generate(
-            model       = model,
-            tokenizer   = tokenizer,
-            prompt      = args.prompt,
-            max_tokens  = args.max_tokens,
-            temperature = args.temperature,
-            top_p       = args.top_p,
-            top_k       = args.top_k,
-            device      = device,
-            bf16        = args.bf16,
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(args.checkpoint),
+                "prompt_chars": len(prompt),
+                "generated_tokens": len(generated_ids),
+                "temperature": args.temperature,
+                "top_k": args.top_k,
+                "repetition_penalty": args.repetition_penalty,
+                "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                "eos_token_id": eos_token_id,
+                "stop_on_eos": not args.disable_eos_stop,
+                "device": str(device),
+                "dtype": str(inference_dtype).replace("torch.", ""),
+                "tokenizer": tokenizer.kind,
+            }
         )
-        if args.n_samples > 1:
-            print(f"[Sample {i+1}]")
-        print(text)
-        print("─" * 60)
+    )
+    print()
+    print(text)
+
+    if args.output_file is not None:
+        args.output_file.parent.mkdir(parents=True, exist_ok=True)
+        args.output_file.write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
